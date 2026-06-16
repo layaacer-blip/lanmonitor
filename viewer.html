@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>監看台 · LAN Screen Monitor</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div class="topbar">
+  <span class="brand"><b>●</b> 監看台 / Monitor</span>
+  <span class="roomtag">房間 <b id="roomTag">—</b></span>
+  <span class="pill" id="count"><span class="dot">●</span> 0 台裝置</span>
+  <div class="spacer"></div>
+  <button id="backBtn" class="hidden">← 返回總覽</button>
+  <button id="roomBtn">切換房間</button>
+  <button id="logToggle">事件紀錄</button>
+</div>
+
+<div id="gridView">
+  <div class="grid" id="grid"></div>
+  <div class="empty" id="empty">尚無受監看裝置上線。請在各裝置開啟 client.html，使用相同房間代碼登入。</div>
+</div>
+
+<div id="singleView" class="single hidden">
+  <div class="bar">
+    <h2 id="singleName">—</h2>
+    <span class="status" id="singleStatus">—</span>
+    <div class="spacer"></div>
+    <button id="fitBtn">填滿</button>
+  </div>
+  <div class="stage"><video id="singleVideo" autoplay muted playsinline></video></div>
+</div>
+
+<div class="log hidden" id="log">
+  <h3>事件紀錄</h3>
+  <ul id="logList"></ul>
+</div>
+
+<script src="https://unpkg.com/peerjs@1/dist/peerjs.min.js"></script>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const params = new URLSearchParams(location.search);
+  const room = (params.get('room') || 'main').trim();
+  const HUB = 'lsm-' + room + '-hub';
+
+  const grid = $('grid'), empty = $('empty'), countPill = $('count'), roomTag = $('roomTag');
+  const gridView = $('gridView'), singleView = $('singleView');
+  const singleVideo = $('singleVideo'), singleName = $('singleName'), singleStatus = $('singleStatus');
+  const backBtn = $('backBtn'), roomBtn = $('roomBtn'), fitBtn = $('fitBtn');
+  const logEl = $('log'), logList = $('logList'), logToggle = $('logToggle');
+
+  roomTag.textContent = room;
+
+  /** peerId -> { name, stream } */
+  const devices = new Map();
+  let focusId = null;
+  let peer;
+
+  if (typeof Peer === 'undefined') {
+    empty.textContent = '無法載入 P2P 元件，請確認此裝置可連上網際網路。';
+  } else {
+    peer = new Peer(HUB); // claim the deterministic hub id for this room
+    peer.on('open', () => { empty.textContent = '監看台已就緒（房間：' + room + '）。等待裝置登入…'; });
+    peer.on('error', (err) => {
+      if (err.type === 'unavailable-id') {
+        empty.textContent = '此房間已有另一個監看台在執行。請改用不同房間代碼，或關閉另一個監看台。';
+      } else if (err.type !== 'peer-unavailable') {
+        empty.textContent = '連線錯誤：' + err.type;
+      }
+    });
+    peer.on('disconnected', () => { try { peer.reconnect(); } catch (e) {} });
+
+    // Incoming data channel = registration + lockdown events.
+    peer.on('connection', (conn) => {
+      conn.on('data', (d) => {
+        if (!d) return;
+        if (d.type === 'hello') { ensureDevice(conn.peer).name = d.name; refresh(); }
+        else if (d.type === 'event') { addLog(conn.peer, d.event, d.ts); }
+      });
+      conn.on('close', () => removeDevice(conn.peer));
+    });
+
+    // Incoming media call = a device's screen. Answer with no stream (receive only).
+    peer.on('call', (call) => {
+      call.answer();
+      call.on('stream', (stream) => { ensureDevice(call.peer).stream = stream; refresh(); });
+      call.on('close', () => removeDevice(call.peer));
+    });
+  }
+
+  function ensureDevice(id) {
+    if (!devices.has(id)) devices.set(id, { name: '未命名裝置', stream: null });
+    return devices.get(id);
+  }
+
+  function removeDevice(id) {
+    if (!devices.has(id)) return;
+    devices.delete(id);
+    if (focusId === id) showGrid();
+    refresh();
+  }
+
+  function refresh() {
+    countPill.innerHTML = '<span class="dot">●</span> ' + devices.size + ' 台裝置';
+    if (focusId) return;
+    empty.classList.toggle('hidden', devices.size > 0);
+
+    const ids = new Set(devices.keys());
+    [...grid.children].forEach((t) => { if (!ids.has(t.dataset.id)) t.remove(); });
+
+    for (const [id, d] of devices) {
+      let tile = $('tile-' + id);
+      if (!tile) {
+        tile = document.createElement('div');
+        tile.className = 'tile';
+        tile.id = 'tile-' + id;
+        tile.dataset.id = id;
+        tile.innerHTML =
+          '<div class="frame">' +
+            '<span class="placeholder" id="ph-' + id + '">等待畫面…</span>' +
+            '<video class="hidden" id="vid-' + id + '" autoplay muted playsinline></video>' +
+          '</div>' +
+          '<div class="meta"><span class="name"></span><span class="status live" id="st-' + id + '">連線中</span></div>';
+        tile.addEventListener('click', () => showSingle(id));
+        grid.appendChild(tile);
+      }
+      tile.querySelector('.name').textContent = d.name;
+      const vid = $('vid-' + id), ph = $('ph-' + id);
+      if (d.stream && vid.srcObject !== d.stream) {
+        vid.srcObject = d.stream; vid.classList.remove('hidden'); ph.classList.add('hidden');
+      }
+    }
+  }
+
+  function showSingle(id) {
+    const d = devices.get(id); if (!d) return;
+    focusId = id;
+    singleName.textContent = d.name;
+    singleVideo.srcObject = d.stream || null;
+    gridView.classList.add('hidden');
+    singleView.classList.remove('hidden');
+    backBtn.classList.remove('hidden');
+  }
+
+  function showGrid() {
+    focusId = null;
+    singleVideo.srcObject = null;
+    singleView.classList.add('hidden');
+    gridView.classList.remove('hidden');
+    backBtn.classList.add('hidden');
+    refresh();
+  }
+
+  backBtn.addEventListener('click', showGrid);
+  roomBtn.addEventListener('click', () => {
+    const r = prompt('輸入房間代碼：', room);
+    if (r && r.trim()) location.search = '?room=' + encodeURIComponent(r.trim());
+  });
+  fitBtn.addEventListener('click', () => {
+    const filling = singleVideo.style.objectFit === 'cover';
+    singleVideo.style.objectFit = filling ? 'contain' : 'cover';
+    fitBtn.textContent = filling ? '填滿' : '原始比例';
+  });
+  logToggle.addEventListener('click', () => logEl.classList.toggle('hidden'));
+
+  function addLog(id, type, ts) {
+    const d = devices.get(id);
+    const li = document.createElement('li');
+    const time = new Date(ts || Date.now()).toLocaleTimeString();
+    if (/close|fullscreen|hidden|blur|stopped/.test(type)) li.className = 'alert';
+    li.innerHTML = '<span class="t">' + time + '</span> · ' +
+      esc(d ? d.name : id) + ' → ' + esc(type);
+    logList.prepend(li);
+    while (logList.children.length > 100) logList.lastChild.remove();
+  }
+  function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+  // Liveness tick
+  setInterval(() => {
+    for (const [id, d] of devices) {
+      const live = d.stream && d.stream.active;
+      const cls = live ? 'status live' : 'status stale';
+      const txt = live ? '即時' : '等待畫面';
+      const st = $('st-' + id); if (st) { st.className = cls; st.textContent = txt; }
+      if (focusId === id) { singleStatus.className = cls; singleStatus.textContent = txt; }
+    }
+  }, 1000);
+})();
+</script>
+</body>
+</html>
